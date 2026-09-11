@@ -1885,6 +1885,7 @@ export function renderHome(root, ctx, activeAccountId) {
     return;
   }
   const rules = ctx.db.getPropRules(activeAccountId);
+  const personalRules = ctx.db.getPersonalRules(activeAccountId);
   const trades = ctx.db.getTrades(activeAccountId);
   const accounts = ctx.db.getAccounts();
 
@@ -1924,8 +1925,10 @@ export function renderHome(root, ctx, activeAccountId) {
           <span class="value num">${formatCents(snapshot.totalPnlCents, account.currency)} / ${formatMoney(snapshot.profitTargetCents, account.currency)}</span>
         </div>
         <div class="progress-track"><div class="progress-fill ${progressClass}" style="width:${clampPct(snapshot.profitTargetProgressPct)}%"></div></div>
-        <div class="field-hint">${snapshot.profitTargetProgressPct.toFixed(1)}% completado</div>
+        <div class="field-hint">${snapshot.profitTargetProgressPct.toFixed(1)}% completado — acumulado de todo el challenge, no se resetea cada día.</div>
       </div>
+
+      ${dailyTargetHtml(snapshot, personalRules, account.currency)}
 
       <div class="metric-grid">
         <div class="metric-cell">
@@ -1991,7 +1994,6 @@ export function renderHome(root, ctx, activeAccountId) {
   `;
 
   root.querySelector('#can-i-trade-btn').addEventListener('click', () => {
-    const personalRules = ctx.db.getPersonalRules(activeAccountId);
     const result = canITrade(snapshot, rules, personalRules, trades);
     renderCanITradeSheet(ctx, result, account.currency);
   });
@@ -2002,6 +2004,39 @@ export function renderHome(root, ctx, activeAccountId) {
 
   const switcherBtn = root.querySelector('#switch-account-btn');
   if (switcherBtn) switcherBtn.addEventListener('click', () => ctx.navigate('accounts'));
+
+  const setTargetBtn = root.querySelector('#set-daily-target-btn');
+  if (setTargetBtn) setTargetBtn.addEventListener('click', () => ctx.navigate('account-settings'));
+}
+
+function dailyTargetHtml(snapshot, personalRules, currency) {
+  if (!personalRules.stopAfterDailyTargetCents) {
+    return `
+      <div class="card">
+        <div class="progress-row mt-0"><span class="title">META DIARIA PERSONAL</span></div>
+        <div class="field-hint" style="margin-bottom:10px;">Todavía no configuraste una meta de ganancia para hoy. Se resetea cada día, a diferencia del Profit Target.</div>
+        <button class="btn btn-secondary" id="set-daily-target-btn">Configurar meta diaria</button>
+      </div>
+    `;
+  }
+  const target = personalRules.stopAfterDailyTargetCents;
+  const pct = clampPct((snapshot.dailyPnlCents / target) * 100);
+  const reached = snapshot.dailyPnlCents >= target;
+  const barClass = reached ? 'safe' : 'accent';
+  return `
+    <div class="card" style="border-color:${reached ? 'var(--safe)' : 'var(--border-hairline)'};">
+      <div class="progress-row mt-0">
+        <span class="title">META DIARIA PERSONAL</span>
+        <span class="value num">${formatCents(snapshot.dailyPnlCents, currency)} / ${formatMoney(target, currency)}</span>
+      </div>
+      <div class="progress-track"><div class="progress-fill ${barClass}" style="width:${pct}%"></div></div>
+      <div class="field-hint" style="margin-top:8px;color:${reached ? 'var(--safe)' : 'var(--text-tertiary)'};">
+        ${reached
+          ? '✓ Meta diaria alcanzada — considera detenerte por hoy, no necesitas arriesgar más.'
+          : `Se resetea cada día. Te faltan ${formatMoney(target - snapshot.dailyPnlCents, currency)} para llegar hoy.`}
+      </div>
+    </div>
+  `;
 }
 
 function accountSwitcherHtml(account, accounts) {
