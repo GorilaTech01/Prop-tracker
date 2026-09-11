@@ -862,7 +862,12 @@ export function calculateAccountSnapshot(account, rules, trades, { today, hasAct
 
   const drawdown = calculateDrawdown(account, rules, trades);
 
-  const profitTargetCents = pctOfCents(account.startingBalanceCents, rules.profitTargetPct);
+  // Profit target: por porcentaje del starting balance (modo Prop Firm) o por
+  // un balance total objetivo fijo (modo personal, ej. "quiero llegar a $10,000").
+  const profitTargetCents = rules.profitTargetMode === 'balance'
+    ? Math.max(0, (rules.profitTargetBalanceCents ?? 0) - account.startingBalanceCents)
+    : pctOfCents(account.startingBalanceCents, rules.profitTargetPct);
+  const profitTargetBalanceCents = account.startingBalanceCents + profitTargetCents;
   const profitTargetProgressPct = Math.max(0, pctOf(totalPnlCents, profitTargetCents));
 
   const winRatePct = calculateWinRate(trades);
@@ -895,6 +900,7 @@ export function calculateAccountSnapshot(account, rules, trades, { today, hasAct
     drawdownRemainingCents: drawdown.remainingCents,
     drawdownUsedPct: drawdown.usedPct,
     profitTargetCents,
+    profitTargetBalanceCents,
     profitTargetProgressPct,
     winRatePct,
     tradingDaysCount,
@@ -1798,8 +1804,20 @@ export function renderNewAccount(root, ctx) {
         <div class="field-hint" style="margin-bottom:14px;">Configura esto exactamente como lo indica tu Prop Firm. Puedes editarlo después en Account Settings.</div>
 
         <div class="field">
+          <label>¿Cómo quieres fijar tu meta?</label>
+          <div class="segmented" id="target-mode-segmented">
+            <button type="button" data-val="percent" class="active">% de ganancia</button>
+            <button type="button" data-val="balance">Monto total a alcanzar</button>
+          </div>
+          <input type="hidden" name="profitTargetMode" value="percent" />
+        </div>
+        <div class="field" id="target-percent-field">
           <label>Profit Target (%)</label>
-          <input type="number" name="profitTargetPct" placeholder="10" step="0.1" required />
+          <input type="number" name="profitTargetPct" placeholder="10" step="0.1" />
+        </div>
+        <div class="field" id="target-balance-field" style="display:none;">
+          <label>¿A cuánto quieres llegar? (balance total de la cuenta)</label>
+          <input type="number" name="profitTargetBalance" placeholder="10000" step="0.01" />
         </div>
         <div class="field">
           <label>Maximum Daily Loss (%)</label>
@@ -1832,9 +1850,24 @@ export function renderNewAccount(root, ctx) {
     </div>
   `;
 
+  const modeSeg = root.querySelector('#target-mode-segmented');
+  const percentField = root.querySelector('#target-percent-field');
+  const balanceField = root.querySelector('#target-balance-field');
+  modeSeg.querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      modeSeg.querySelectorAll('button').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      modeSeg.parentElement.querySelector('input[name="profitTargetMode"]').value = btn.dataset.val;
+      const isBalance = btn.dataset.val === 'balance';
+      percentField.style.display = isBalance ? 'none' : 'block';
+      balanceField.style.display = isBalance ? 'block' : 'none';
+    });
+  });
+
   root.querySelector('#new-account-form').addEventListener('submit', (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
+    const targetMode = fd.get('profitTargetMode');
 
     const account = ctx.db.createAccount({
       propFirm: fd.get('propFirm').trim(),
@@ -1846,7 +1879,9 @@ export function renderNewAccount(root, ctx) {
     });
 
     ctx.db.setPropRules(account.id, {
-      profitTargetPct: Number(fd.get('profitTargetPct')),
+      profitTargetMode: targetMode,
+      profitTargetPct: targetMode === 'percent' ? Number(fd.get('profitTargetPct')) : undefined,
+      profitTargetBalanceCents: targetMode === 'balance' ? toCents(fd.get('profitTargetBalance')) : undefined,
       maxDailyLossPct: Number(fd.get('maxDailyLossPct')),
       maxOverallLossPct: Number(fd.get('maxOverallLossPct')),
       maxTradesPerDay: fd.get('maxTradesPerDay') ? Number(fd.get('maxTradesPerDay')) : undefined,
@@ -1899,8 +1934,7 @@ export function renderHome(root, ctx, activeAccountId) {
   const progressClass = snapshot.status === 'danger' || snapshot.status === 'rule_violated' ? 'danger' : snapshot.status === 'warning' ? 'warning' : 'accent';
   const dailyLossPct = clampPct((snapshot.dailyLossUsedCents / (snapshot.dailyLossLimitCents || 1)) * 100);
   const dailyLossClass = dailyLossPct >= 90 ? 'danger' : dailyLossPct >= 50 ? 'warning' : 'safe';
-  const drawdownPct = clampPct((snapshot.drawdownUsedCents / (snapshot.drawdownLimitCents || 1)) * 100);
-  const drawdownClass = drawdownPct >= 90 ? 'danger' : drawdownPct >= 50 ? 'warning' : 'safe';
+  const isBalanceMode = rules.profitTargetMode === 'balance';
 
   root.innerHTML = `
     <div class="screen">
@@ -1921,11 +1955,13 @@ export function renderHome(root, ctx, activeAccountId) {
 
       <div class="progress-block">
         <div class="progress-row">
-          <span class="title">PROFIT TARGET</span>
-          <span class="value num">${formatCents(snapshot.totalPnlCents, account.currency)} / ${formatMoney(snapshot.profitTargetCents, account.currency)}</span>
+          <span class="title">${isBalanceMode ? 'ACCOUNT GOAL' : 'PROFIT TARGET'}</span>
+          <span class="value num">${isBalanceMode
+            ? `${formatMoney(snapshot.currentBalanceCents, account.currency)} / ${formatMoney(snapshot.profitTargetBalanceCents, account.currency)}`
+            : `${formatCents(snapshot.totalPnlCents, account.currency)} / ${formatMoney(snapshot.profitTargetCents, account.currency)}`}</span>
         </div>
         <div class="progress-track"><div class="progress-fill ${progressClass}" style="width:${clampPct(snapshot.profitTargetProgressPct)}%"></div></div>
-        <div class="field-hint">${snapshot.profitTargetProgressPct.toFixed(1)}% completado — acumulado de todo el challenge, no se resetea cada día.</div>
+        <div class="field-hint">${snapshot.profitTargetProgressPct.toFixed(1)}% completado — acumulado de toda la cuenta, no se resetea cada día.</div>
       </div>
 
       ${dailyTargetHtml(snapshot, personalRules, account.currency)}
@@ -1944,10 +1980,6 @@ export function renderHome(root, ctx, activeAccountId) {
           <div class="value num">${formatMoney(snapshot.dailyLossRemainingCents, account.currency)}</div>
         </div>
         <div class="metric-cell">
-          <div class="label">MAX DRAWDOWN AVAILABLE</div>
-          <div class="value num">${formatMoney(snapshot.drawdownRemainingCents, account.currency)}</div>
-        </div>
-        <div class="metric-cell">
           <div class="label">WIN RATE</div>
           <div class="value num">${snapshot.winRatePct.toFixed(0)}%</div>
         </div>
@@ -1963,14 +1995,6 @@ export function renderHome(root, ctx, activeAccountId) {
           <span class="value num">${formatMoney(snapshot.dailyLossUsedCents, account.currency)} / ${formatMoney(snapshot.dailyLossLimitCents, account.currency)}</span>
         </div>
         <div class="progress-track"><div class="progress-fill ${dailyLossClass}" style="width:${dailyLossPct}%"></div></div>
-      </div>
-
-      <div class="card">
-        <div class="progress-row mt-0">
-          <span class="title">MAX DRAWDOWN USED</span>
-          <span class="value num">${formatMoney(snapshot.drawdownUsedCents, account.currency)} / ${formatMoney(snapshot.drawdownLimitCents, account.currency)}</span>
-        </div>
-        <div class="progress-track"><div class="progress-fill ${drawdownClass}" style="width:${drawdownPct}%"></div></div>
       </div>
 
       <div class="card">
@@ -2813,7 +2837,22 @@ export function renderAccountSettings(root, ctx, accountId) {
 
       <div class="section-title">Reglas de la Prop Firm</div>
       <form id="prop-rules-form">
-        <div class="field"><label>Profit Target (%)</label><input type="number" step="0.1" name="profitTargetPct" value="${rules.profitTargetPct ?? ''}" required /></div>
+        <div class="field">
+          <label>¿Cómo quieres fijar tu meta?</label>
+          <div class="segmented" id="target-mode-segmented">
+            <button type="button" data-val="percent" class="${(rules.profitTargetMode ?? 'percent') === 'percent' ? 'active' : ''}">% de ganancia</button>
+            <button type="button" data-val="balance" class="${rules.profitTargetMode === 'balance' ? 'active' : ''}">Monto total a alcanzar</button>
+          </div>
+          <input type="hidden" name="profitTargetMode" value="${rules.profitTargetMode ?? 'percent'}" />
+        </div>
+        <div class="field" id="target-percent-field" style="${rules.profitTargetMode === 'balance' ? 'display:none;' : ''}">
+          <label>Profit Target (%)</label>
+          <input type="number" step="0.1" name="profitTargetPct" value="${rules.profitTargetPct ?? ''}" />
+        </div>
+        <div class="field" id="target-balance-field" style="${rules.profitTargetMode === 'balance' ? '' : 'display:none;'}">
+          <label>¿A cuánto quieres llegar? (balance total de la cuenta)</label>
+          <input type="number" step="0.01" name="profitTargetBalance" value="${rules.profitTargetBalanceCents != null ? fromCents(rules.profitTargetBalanceCents) : ''}" />
+        </div>
         <div class="field"><label>Profit Target Stage 2 (%) — opcional</label><input type="number" step="0.1" name="profitTargetStage2Pct" value="${rules.profitTargetStage2Pct ?? ''}" /></div>
         <div class="field"><label>Maximum Daily Loss (%)</label><input type="number" step="0.1" name="maxDailyLossPct" value="${rules.maxDailyLossPct ?? ''}" required /></div>
         <div class="field"><label>Maximum Overall Loss (%)</label><input type="number" step="0.1" name="maxOverallLossPct" value="${rules.maxOverallLossPct ?? ''}" required /></div>
@@ -2886,6 +2925,20 @@ export function renderAccountSettings(root, ctx, accountId) {
     });
   });
 
+  const modeSeg = root.querySelector('#target-mode-segmented');
+  const percentField = root.querySelector('#target-percent-field');
+  const balanceField = root.querySelector('#target-balance-field');
+  modeSeg.querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      modeSeg.querySelectorAll('button').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      modeSeg.parentElement.querySelector('input[name="profitTargetMode"]').value = btn.dataset.val;
+      const isBalance = btn.dataset.val === 'balance';
+      percentField.style.display = isBalance ? 'none' : 'block';
+      balanceField.style.display = isBalance ? 'block' : 'none';
+    });
+  });
+
   root.querySelector('#account-form').addEventListener('submit', (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -2903,8 +2956,11 @@ export function renderAccountSettings(root, ctx, accountId) {
     e.preventDefault();
     const fd = new FormData(e.target);
     const consistencyPct = fd.get('consistencyMaxPct');
+    const targetMode = fd.get('profitTargetMode');
     ctx.db.setPropRules(accountId, {
-      profitTargetPct: Number(fd.get('profitTargetPct')),
+      profitTargetMode: targetMode,
+      profitTargetPct: targetMode === 'percent' ? Number(fd.get('profitTargetPct')) : undefined,
+      profitTargetBalanceCents: targetMode === 'balance' ? toCents(fd.get('profitTargetBalance')) : undefined,
       profitTargetStage2Pct: fd.get('profitTargetStage2Pct') ? Number(fd.get('profitTargetStage2Pct')) : undefined,
       maxDailyLossPct: Number(fd.get('maxDailyLossPct')),
       maxOverallLossPct: Number(fd.get('maxOverallLossPct')),
