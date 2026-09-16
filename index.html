@@ -803,8 +803,18 @@ export function calculateDrawdown(account, rules, trades) {
 
 
 
-export function calculateCurrentBalance(account, trades) {
-  return addCents(account.startingBalanceCents, ...trades.map((t) => t.pnlCents));
+// El balance real incluye depósitos/retiros; el P/L de trading (para el profit target,
+// win rate, etc.) se mide SOLO por trades — un depósito no es "ganancia".
+export function calculateCurrentBalance(account, trades, adjustments = []) {
+  return addCents(
+    account.startingBalanceCents,
+    ...trades.map((t) => t.pnlCents),
+    ...adjustments.map((a) => a.amountCents)
+  );
+}
+
+export function calculateNetAdjustments(adjustments = []) {
+  return addCents(...adjustments.map((a) => a.amountCents));
 }
 
 export function getTradesForDate(trades, date) {
@@ -845,9 +855,12 @@ function determineStatus(dailyLossUsedPct, drawdownUsedPct, hasViolation) {
   return 'safe';
 }
 
-export function calculateAccountSnapshot(account, rules, trades, { today, hasActiveViolation = false }) {
-  const currentBalanceCents = calculateCurrentBalance(account, trades);
-  const totalPnlCents = currentBalanceCents - account.startingBalanceCents;
+export function calculateAccountSnapshot(account, rules, trades, options, adjustments = []) {
+  const { today, hasActiveViolation = false } = options;
+  const currentBalanceCents = calculateCurrentBalance(account, trades, adjustments);
+  // Trading-only: los depósitos/retiros no cuentan como ganancia ni afectan el profit target.
+  const totalPnlCents = addCents(...trades.map((t) => t.pnlCents));
+  const netAdjustmentsCents = calculateNetAdjustments(adjustments);
   const returnPct = pctOf(totalPnlCents, account.startingBalanceCents);
 
   const dailyPnlCents = calculateDailyPnl(trades, today);
@@ -888,6 +901,7 @@ export function calculateAccountSnapshot(account, rules, trades, { today, hasAct
     accountId: account.id,
     currentBalanceCents,
     totalPnlCents,
+    netAdjustmentsCents,
     returnPct,
     dailyPnlCents,
     tradesToday,
@@ -1297,13 +1311,18 @@ function topEntry(map, best) {
 }
 
 // Curva de equity: puntos (fecha, balance acumulado) para graficar.
-export function buildEquityCurve(account, trades) {
-  const sorted = [...trades].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+// Incluye depósitos/retiros en orden cronológico junto con los trades.
+export function buildEquityCurve(account, trades, adjustments = []) {
+  const events = [
+    ...trades.map((t) => ({ date: t.date, time: t.time, amountCents: t.pnlCents })),
+    ...adjustments.map((a) => ({ date: a.date, time: '00:00', amountCents: a.amountCents })),
+  ].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+
   let running = account.startingBalanceCents;
   const points = [{ date: account.challengeStartDate, balanceCents: running }];
-  for (const t of sorted) {
-    running += t.pnlCents;
-    points.push({ date: t.date, balanceCents: running });
+  for (const e of events) {
+    running += e.amountCents;
+    points.push({ date: e.date, balanceCents: running });
   }
   return points;
 }
@@ -1442,6 +1461,7 @@ function emptyState() {
     propRules: {}, // accountId -> PropRules
     personalRules: {}, // accountId -> PersonalRules
     trades: [], // Trade[]
+    adjustments: [], // BalanceAdjustment[] — depósitos y retiros de efectivo
     dailyPlans: [], // DailyTradingPlan[]
     dailyJournals: [], // DailyJournal[]
     ruleEvents: [], // RuleEvent[]
@@ -1494,6 +1514,7 @@ export const db = {
   deleteAccount(id) {
     state.accounts = state.accounts.filter((a) => a.id !== id);
     state.trades = state.trades.filter((t) => t.accountId !== id);
+    state.adjustments = state.adjustments.filter((a) => a.accountId !== id);
     delete state.propRules[id];
     delete state.personalRules[id];
     state.dailyPlans = state.dailyPlans.filter((p) => p.accountId !== id);
@@ -1589,6 +1610,24 @@ export const db = {
     state.dailyJournals[idx] = { ...state.dailyJournals[idx], ...data };
     persist();
     return state.dailyJournals[idx];
+  },
+
+  // ---- Balance adjustments (depósitos / retiros) ----
+  // amountCents es firmado: positivo = depósito, negativo = retiro.
+  getAdjustments(accountId) {
+    return state.adjustments
+      .filter((a) => a.accountId === accountId)
+      .sort((a, b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt));
+  },
+  createAdjustment(data) {
+    const adjustment = { id: uid(), createdAt: nowISO(), ...data };
+    state.adjustments.push(adjustment);
+    persist();
+    return adjustment;
+  },
+  deleteAdjustment(id) {
+    state.adjustments = state.adjustments.filter((a) => a.id !== id);
+    persist();
   },
 
   // ---- Rule events ----
@@ -1739,6 +1778,101 @@ export function renderCanITradeSheet(ctx, result, currency) {
 function escapeHtml(str) {
   return String(str ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
+
+// ---- js/ui/fundsSheet.js ----
+
+
+
+export function openAddFundsSheet(ctx, accountId, currency) {
+  ctx.openSheet(`
+    <div class="card-title">Depositar / Retirar fondos</div>
+    <div class="field-hint" style="margin-bottom:14px;">Ajusta el balance real de tu cuenta. Esto no cuenta como ganancia ni afecta tu Profit Target ni tus estadísticas de trading.</div>
+    <form id="funds-form">
+      <div class="field">
+        <label>Tipo</label>
+        <div class="segmented" id="funds-type-segmented">
+          <button type="button" data-val="deposit" class="active buy">Depósito</button>
+          <button type="button" data-val="withdrawal" class="sell">Retiro</button>
+        </div>
+        <input type="hidden" name="type" value="deposit" />
+      </div>
+      <div class="field">
+        <label>Monto</label>
+        <input type="number" name="amount" step="0.01" placeholder="500" required />
+      </div>
+      <div class="field">
+        <label>Fecha</label>
+        <input type="date" name="date" value="${todayISO()}" required />
+      </div>
+      <div class="field">
+        <label>Nota (opcional)</label>
+        <input type="text" name="note" placeholder="Ej. Retiro de ganancias" />
+      </div>
+      <button type="submit" class="btn btn-primary">Guardar</button>
+    </form>
+  `, (sheetEl) => {
+    const typeSeg = sheetEl.querySelector('#funds-type-segmented');
+    typeSeg.querySelectorAll('button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        typeSeg.querySelectorAll('button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        typeSeg.parentElement.querySelector('input[name="type"]').value = btn.dataset.val;
+      });
+    });
+
+    sheetEl.querySelector('#funds-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const type = fd.get('type');
+      const rawCents = toCents(fd.get('amount'));
+      const amountCents = type === 'withdrawal' ? -Math.abs(rawCents) : Math.abs(rawCents);
+
+      ctx.db.createAdjustment({
+        accountId,
+        type,
+        amountCents,
+        date: fd.get('date'),
+        note: fd.get('note') || undefined,
+      });
+
+      ctx.closeSheet();
+      ctx.toast(type === 'deposit' ? 'Depósito registrado' : 'Retiro registrado');
+      ctx.rerender();
+    });
+  });
+}
+
+export function renderFundsList(ctx, accountId, currency) {
+  const adjustments = ctx.db.getAdjustments(accountId);
+  if (adjustments.length === 0) {
+    return `<div class="field-hint">Todavía no registraste depósitos ni retiros.</div>`;
+  }
+  return adjustments.map((a) => `
+    <div class="trade-row" data-adjustment-id="${a.id}">
+      <div class="left">
+        <div class="symbol">${a.type === 'deposit' ? 'Depósito' : 'Retiro'}</div>
+        <div class="meta">${formatDateHuman(a.date)}${a.note ? ' · ' + escapeHtml(a.note) : ''}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span class="pnl" style="color:${a.amountCents >= 0 ? 'var(--safe)' : 'var(--danger)'}">${formatCents(a.amountCents, currency)}</span>
+        <button class="btn btn-ghost" data-delete-adjustment="${a.id}" style="width:auto;padding:6px 10px;">✕</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+export function attachFundsListEvents(root, ctx) {
+  root.querySelectorAll('[data-delete-adjustment]').forEach((btn) => {
+    btn.onclick = () => {
+      if (confirm('¿Eliminar este movimiento?')) {
+        ctx.db.deleteAdjustment(btn.dataset.deleteAdjustment);
+        ctx.toast('Movimiento eliminado');
+        ctx.rerender();
+      }
+    };
+  });
+}
+
 
 // ---- js/ui/onboarding.js ----
 export function renderOnboarding(root, ctx) {
@@ -1904,6 +2038,7 @@ export function renderNewAccount(root, ctx) {
 
 
 
+
 const STATUS_LABEL = {
   safe: 'SAFE',
   warning: 'WARNING',
@@ -1922,12 +2057,13 @@ export function renderHome(root, ctx, activeAccountId) {
   const rules = ctx.db.getPropRules(activeAccountId);
   const personalRules = ctx.db.getPersonalRules(activeAccountId);
   const trades = ctx.db.getTrades(activeAccountId);
+  const adjustments = ctx.db.getAdjustments(activeAccountId);
   const accounts = ctx.db.getAccounts();
 
-  let snapshot = calculateAccountSnapshot(account, rules, trades, { today: todayISO() });
+  let snapshot = calculateAccountSnapshot(account, rules, trades, { today: todayISO() }, adjustments);
   const ruleResults = evaluatePropRules(snapshot, rules, trades);
   if (hasViolation(ruleResults)) {
-    snapshot = calculateAccountSnapshot(account, rules, trades, { today: todayISO(), hasActiveViolation: true });
+    snapshot = calculateAccountSnapshot(account, rules, trades, { today: todayISO(), hasActiveViolation: true }, adjustments);
   }
 
   const deltaClass = snapshot.totalPnlCents > 0 ? 'pos' : snapshot.totalPnlCents < 0 ? 'neg' : 'flat';
@@ -1950,7 +2086,9 @@ export function renderHome(root, ctx, activeAccountId) {
       <div class="balance-hero">
         <div class="label">Current Balance</div>
         <div class="amount num">${formatMoney(snapshot.currentBalanceCents, account.currency)}</div>
-        <div class="delta ${deltaClass} num">${formatCents(snapshot.totalPnlCents, account.currency)} · ${formatPct(snapshot.returnPct)}</div>
+        <div class="delta ${deltaClass} num">${formatCents(snapshot.totalPnlCents, account.currency)} trading · ${formatPct(snapshot.returnPct)}</div>
+        ${snapshot.netAdjustmentsCents !== 0 ? `<div class="field-hint" style="margin-top:2px;">Incluye ${formatCents(snapshot.netAdjustmentsCents, account.currency)} netos en depósitos/retiros</div>` : ''}
+        <button class="btn btn-ghost" id="add-funds-btn" style="width:auto;margin-top:12px;padding:8px 14px;font-size:13px;">+ Depositar / Retirar fondos</button>
       </div>
 
       <div class="progress-block">
@@ -2017,6 +2155,9 @@ export function renderHome(root, ctx, activeAccountId) {
     </div>
   `;
 
+  root.querySelector('#add-funds-btn').addEventListener('click', () => {
+    openAddFundsSheet(ctx, activeAccountId, account.currency);
+  });
   root.querySelector('#can-i-trade-btn').addEventListener('click', () => {
     const result = canITrade(snapshot, rules, personalRules, trades);
     renderCanITradeSheet(ctx, result, account.currency);
@@ -2406,7 +2547,8 @@ function logRuleEventsIfAny(ctx, accountId) {
   const rules = ctx.db.getPropRules(accountId);
   const personalRules = ctx.db.getPersonalRules(accountId);
   const trades = ctx.db.getTrades(accountId);
-  const snapshot = calculateAccountSnapshot(account, rules, trades, { today: trades[trades.length - 1]?.date || account.challengeStartDate });
+  const adjustments = ctx.db.getAdjustments(accountId);
+  const snapshot = calculateAccountSnapshot(account, rules, trades, { today: trades[trades.length - 1]?.date || account.challengeStartDate }, adjustments);
 
   const propResults = evaluatePropRules(snapshot, rules, trades).filter((r) => r.status !== 'ok');
   const personalResults = evaluatePersonalRules(snapshot, personalRules).filter((r) => r.status !== 'ok');
@@ -2695,6 +2837,7 @@ export function renderAnalytics(root, ctx, accountId) {
   const account = ctx.db.getAccount(accountId);
   const rules = ctx.db.getPropRules(accountId);
   const trades = ctx.db.getTrades(accountId);
+  const adjustments = ctx.db.getAdjustments(accountId);
 
   if (!account || trades.length === 0) {
     root.innerHTML = `
@@ -2711,7 +2854,7 @@ export function renderAnalytics(root, ctx, accountId) {
   }
 
   const stats = calculateStatistics(trades);
-  const curve = buildEquityCurve(account, trades);
+  const curve = buildEquityCurve(account, trades, adjustments);
   const habits = detectHabits(trades);
   const currency = account.currency;
 
@@ -2798,6 +2941,7 @@ function equityCurveSvg(points, startingBalanceCents, rules) {
 
 
 // ---- js/ui/accountSettings.js ----
+
 
 export function renderAccountSettings(root, ctx, accountId) {
   const account = ctx.db.getAccount(accountId);
@@ -2901,6 +3045,12 @@ export function renderAccountSettings(root, ctx, accountId) {
         <button type="submit" class="btn btn-secondary">Guardar reglas personales</button>
       </form>
 
+      <div class="section-title">Fondos (depósitos / retiros)</div>
+      <div class="card">
+        ${renderFundsList(ctx, accountId, account.currency)}
+      </div>
+      <button class="btn btn-secondary" id="add-funds-settings-btn" style="margin-bottom:8px;">+ Depositar / Retirar fondos</button>
+
       <div class="section-title">Datos</div>
       <div class="btn-row" style="margin-bottom:10px;">
         <button class="btn btn-ghost" id="export-csv-btn">Export CSV</button>
@@ -2937,6 +3087,11 @@ export function renderAccountSettings(root, ctx, accountId) {
       percentField.style.display = isBalance ? 'none' : 'block';
       balanceField.style.display = isBalance ? 'block' : 'none';
     });
+  });
+
+  attachFundsListEvents(root, ctx);
+  root.querySelector('#add-funds-settings-btn').addEventListener('click', () => {
+    openAddFundsSheet(ctx, accountId, account.currency);
   });
 
   root.querySelector('#account-form').addEventListener('submit', (e) => {
@@ -3116,7 +3271,8 @@ export function renderAccountsOverview(root, ctx) {
 function accountCardHtml(ctx, account, isActive) {
   const rules = ctx.db.getPropRules(account.id);
   const trades = ctx.db.getTrades(account.id);
-  const snapshot = calculateAccountSnapshot(account, rules, trades, { today: todayISO() });
+  const adjustments = ctx.db.getAdjustments(account.id);
+  const snapshot = calculateAccountSnapshot(account, rules, trades, { today: todayISO() }, adjustments);
 
   return `
     <div class="card" style="border-color:${isActive ? 'var(--accent)' : 'var(--border-hairline)'};">
@@ -3163,8 +3319,9 @@ export function renderProgress(root, ctx, accountId) {
   const account = ctx.db.getAccount(accountId);
   const rules = ctx.db.getPropRules(accountId);
   const trades = ctx.db.getTrades(accountId);
+  const adjustments = ctx.db.getAdjustments(accountId);
   const events = ctx.db.getRuleEvents(accountId);
-  const snapshot = calculateAccountSnapshot(account, rules, trades, { today: todayISO() });
+  const snapshot = calculateAccountSnapshot(account, rules, trades, { today: todayISO() }, adjustments);
   const ruleResults = evaluatePropRules(snapshot, rules, trades);
   const violationsCount = events.filter((e) => e.severity === 'violation').length;
 
